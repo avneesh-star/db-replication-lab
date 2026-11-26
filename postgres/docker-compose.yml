@@ -1,0 +1,74 @@
+# PostgreSQL streaming replication lab: one primary and two hot-standby replicas.
+#
+#   docker compose up -d        start (replicas clone the primary on first start)
+#   bash run-all.sh             run every scenario
+#   docker compose down -v      reset everything, including data
+#
+# Which replica is synchronous is not set here: the scenarios switch it at
+# runtime with ALTER SYSTEM, so you can watch the effect of each setting.
+name: pg-replication-lab
+
+x-postgres: &postgres
+  image: postgres:16.3-alpine
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres -d lab"]
+    interval: 2s
+    timeout: 3s
+    retries: 90
+
+x-credentials: &credentials
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: lab
+
+services:
+  pg-primary:
+    <<: *postgres
+    hostname: pg-primary
+    environment: *credentials
+    ports: ["5440:5432"]               # pgAdmin: localhost:5440
+    command:
+      - postgres
+      - -c
+      - wal_level=replica            # write enough WAL for a replica to replay
+      - -c
+      - max_wal_senders=10           # one walsender process per connected replica
+      - -c
+      - max_replication_slots=10
+      - -c
+      - wal_keep_size=64MB
+    volumes:
+      - ./sql:/sql:ro
+      - ./primary-init:/docker-entrypoint-initdb.d:ro
+
+  pg-replica-sync:
+    <<: *postgres
+    hostname: pg-replica-sync
+    entrypoint: ["/bin/sh", "/replica/replica-entrypoint.sh"]
+    ports: ["5441:5432"]               # pgAdmin: localhost:5441
+    environment:
+      <<: *credentials
+      PRIMARY_HOST: pg-primary
+      APP_NAME: replica_sync         # the name synchronous_standby_names refers to
+      SLOT_NAME: slot_replica_sync
+    volumes:
+      - ./sql:/sql:ro
+      - ./replica:/replica:ro
+    depends_on:
+      pg-primary: { condition: service_healthy }
+
+  pg-replica-async:
+    <<: *postgres
+    hostname: pg-replica-async
+    entrypoint: ["/bin/sh", "/replica/replica-entrypoint.sh"]
+    ports: ["5442:5432"]               # pgAdmin: localhost:5442
+    environment:
+      <<: *credentials
+      PRIMARY_HOST: pg-primary
+      APP_NAME: replica_async
+      SLOT_NAME: slot_replica_async
+    volumes:
+      - ./sql:/sql:ro
+      - ./replica:/replica:ro
+    depends_on:
+      pg-primary: { condition: service_healthy }

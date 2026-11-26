@@ -1,0 +1,224 @@
+# Production-style Patroni cluster.
+#
+#   3 x etcd      leader lock store; survives the loss of one member
+#   3 x Postgres  Patroni-managed, synchronous replication, WAL archiving
+#   2 x HAProxy   redundant entry points: :5000 primary, :5001 replicas
+#   Prometheus    metrics and alert rules for Patroni, etcd and HAProxy
+#   api           the .NET app, connecting with a least-privilege role to both HAProxy instances
+#
+# Secrets come from .env (copy .env.example and fill it in).
+#
+#   docker compose up -d --build
+#   docker compose run --rm backup          take a base backup from a replica
+#   bash failover-test.sh
+#   docker compose down -v                  reset everything
+name: patroni-prod
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.14
+  restart: unless-stopped
+
+x-node: &node
+  build: ../patroni
+  image: patroni-lab-node:pg16
+  restart: unless-stopped
+  depends_on: [etcd1, etcd2, etcd3]
+  deploy:
+    resources:
+      limits: { cpus: "1.0", memory: 1g }
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+  stop_grace_period: 30s
+
+x-node-env: &node-env
+  PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+  PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?}
+  PATRONI_RESTAPI_USERNAME: patroni
+  PATRONI_RESTAPI_PASSWORD: ${PATRONI_API_PASSWORD:?}
+  APP_DB_PASSWORD: ${APP_DB_PASSWORD:?}
+  MONITOR_PASSWORD: ${MONITOR_PASSWORD:?}
+
+x-haproxy: &haproxy
+  image: haproxy:2.9-alpine
+  restart: unless-stopped
+  volumes:
+    - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+  depends_on: [pg-node1, pg-node2, pg-node3]
+
+services:
+  # ---- etcd: three members, so the cluster keeps quorum if one fails -------------------
+  etcd1:
+    <<: *etcd
+    hostname: etcd1
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=lab-prod
+      - --initial-cluster-state=new
+    volumes: [etcd1-data:/etcd-data]
+
+  etcd2:
+    <<: *etcd
+    hostname: etcd2
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=lab-prod
+      - --initial-cluster-state=new
+    volumes: [etcd2-data:/etcd-data]
+
+  etcd3:
+    <<: *etcd
+    hostname: etcd3
+    command:
+      - etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=lab-prod
+      - --initial-cluster-state=new
+    volumes: [etcd3-data:/etcd-data]
+
+  # ---- PostgreSQL + Patroni: no host ports, reached only through HAProxy ---------------
+  pg-node1:
+    <<: *node
+    hostname: pg-node1
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg-node1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node1:5432
+    volumes:
+      - ./config:/config:ro
+      - node1-data:/data/pg
+      - wal-archive:/archive
+
+  pg-node2:
+    <<: *node
+    hostname: pg-node2
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg-node2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node2:5432
+    volumes:
+      - ./config:/config:ro
+      - node2-data:/data/pg
+      - wal-archive:/archive
+
+  pg-node3:
+    <<: *node
+    hostname: pg-node3
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg-node3
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node3:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node3:5432
+    volumes:
+      - ./config:/config:ro
+      - node3-data:/data/pg
+      - wal-archive:/archive
+
+  # ---- Two HAProxy instances: clients can use either, so one failing is not an outage --
+  haproxy1:
+    <<: *haproxy
+    hostname: haproxy1
+    ports:
+      - "5460:5000"        # primary
+      - "5461:5001"        # replicas
+      - "7001:7000"        # stats
+
+  haproxy2:
+    <<: *haproxy
+    hostname: haproxy2
+    ports:
+      - "5462:5000"
+      - "5463:5001"
+      - "7002:7000"
+
+  # ---- Monitoring ----------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  # Database metrics (connections, transactions, cache hits, WAL archiving). It connects
+  # through HAProxy's write endpoint, so it always follows the current primary.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://monitor:${MONITOR_PASSWORD:?}@haproxy1:5000/lab?sslmode=disable"
+    depends_on: [haproxy1]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    ports: ["3001:3000"]              # http://localhost:3001  (user admin, password GRAFANA_PASSWORD in .env)
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/postgres-ha.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
+  # ---- Application ---------------------------------------------------------------------
+  api:
+    build: ../dotnet/LinkShortener
+    restart: on-failure
+    ports: ["5101:8080"]
+    environment:
+      # Two HAProxy hosts: the driver moves to the second if the first is unreachable.
+      # app_user can read and write rows but cannot change the schema.
+      ConnectionStrings__Writer: "Host=haproxy1,haproxy2;Port=5000;Database=lab;Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60"
+      ConnectionStrings__Reader: "Host=haproxy1,haproxy2;Port=5001;Database=lab;Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60;Load Balance Hosts=true"
+      Database__EnsureSchema: "false"
+      Resilience__WriteRetryWindowSeconds: "60"
+    depends_on: [haproxy1, haproxy2]
+
+  # ---- Backup job (run on demand: docker compose run --rm backup) ----------------------
+  backup:
+    image: patroni-lab-node:pg16
+    profiles: ["tools"]
+    entrypoint: ["/bin/bash", "/scripts/backup.sh"]
+    environment:
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?}
+    volumes:
+      - ./scripts:/scripts:ro
+      - wal-archive:/archive:ro
+      - backups:/backups
+    depends_on: [haproxy1]
+
+volumes:
+  etcd1-data:
+  etcd2-data:
+  etcd3-data:
+  node1-data:
+  node2-data:
+  node3-data:
+  wal-archive:
+  backups:

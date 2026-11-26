@@ -1,0 +1,11 @@
+# These files run inside Linux containers, so they must keep LF line endings
+# even when checked out on Windows (CRLF breaks `#!/bin/sh` scripts and YAML heredocs).
+* text=auto
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.cfg  text eol=lf
+*.sql  text eol=lf
+*.py   text eol=lf
+Dockerfile text eol=lf
+*.json text eol=lf

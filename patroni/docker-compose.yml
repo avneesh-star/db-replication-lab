@@ -1,0 +1,111 @@
+# Patroni lab: automatic failover for PostgreSQL.
+#
+#   etcd      holds the leader lock (the "who is primary" decision)
+#   pg-node*  Postgres + Patroni; one holds the lock and is primary, the rest are replicas
+#   haproxy   follows the leader: :5000 is always the primary, :5001 is the replicas
+#
+#   docker compose up -d --build
+#   bash failover-demo.sh
+#   docker compose down -v          reset everything
+name: patroni-lab
+
+x-node: &node
+  build: .
+  volumes:
+    - ./config:/config:ro
+  depends_on:
+    etcd: { condition: service_started }
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+    interval: 3s
+    timeout: 3s
+    retries: 60
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    hostname: etcd
+    command:
+      - etcd
+      - --name=etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+
+  pg-node1:
+    <<: *node
+    hostname: pg-node1
+    ports: ["8101:8008"]               # Patroni REST API
+    environment:
+      PATRONI_NAME: pg-node1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node1:5432
+    volumes:
+      - ./config:/config:ro
+      - node1-data:/data/pg
+
+  pg-node2:
+    <<: *node
+    hostname: pg-node2
+    ports: ["8102:8008"]
+    environment:
+      PATRONI_NAME: pg-node2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node2:5432
+    volumes:
+      - ./config:/config:ro
+      - node2-data:/data/pg
+
+  pg-node3:
+    <<: *node
+    hostname: pg-node3
+    ports: ["8103:8008"]
+    environment:
+      PATRONI_NAME: pg-node3
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node3:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node3:5432
+    volumes:
+      - ./config:/config:ro
+      - node3-data:/data/pg
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    hostname: haproxy
+    ports:
+      - "5450:5000"                    # pgAdmin: write endpoint (always the primary)
+      - "5451:5001"                    # pgAdmin: read endpoint (replicas)
+      - "7000:7000"                    # HAProxy stats page
+    volumes:
+      - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - pg-node1
+      - pg-node2
+      - pg-node3
+
+  dashboard:
+    build: ./dashboard
+    hostname: dashboard
+    ports:
+      - "8088:8080"                    # http://localhost:8088
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # lets the Stop/Start buttons control the nodes
+    depends_on:
+      - haproxy
+
+  api:
+    build: ../dotnet/LinkShortener
+    hostname: api
+    restart: on-failure
+    ports:
+      - "5100:8080"                    # http://localhost:5100
+    environment:
+      # Inside the Docker network HAProxy listens on 5000 (writes) and 5001 (reads).
+      ConnectionStrings__Writer: "Host=haproxy;Port=5000;Database=lab;Username=postgres;Password=postgres;Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60"
+      ConnectionStrings__Reader: "Host=haproxy;Port=5001;Database=lab;Username=postgres;Password=postgres;Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60"
+    depends_on:
+      - haproxy
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

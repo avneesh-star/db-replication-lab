@@ -1,0 +1,51 @@
+# Shared Patroni config. Per-node values (name, addresses) come from
+# PATRONI_* environment variables in docker-compose.yml, which override this file.
+scope: lab-cluster
+
+restapi:
+  listen: 0.0.0.0:8008
+
+etcd3:
+  hosts: etcd:2379
+
+bootstrap:
+  # Cluster-wide settings, written to etcd once by the first node and
+  # changed later with `patronictl edit-config`.
+  dcs:
+    ttl: 20                    # leader lock lifetime: how long until a dead leader is replaced
+    loop_wait: 5               # seconds between Patroni's checks
+    retry_timeout: 5           # constraint: loop_wait + 2 * retry_timeout <= ttl
+    maximum_lag_on_failover: 1048576   # a replica more than 1 MB behind is not promoted
+    postgresql:
+      use_pg_rewind: true      # lets the old primary rejoin as a replica
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"    # required by pg_rewind
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - local all all trust
+    - host replication replicator all md5
+    - host all all all md5
+  post_bootstrap: sh /config/post_bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /data/pg
+  bin_dir: /usr/lib/postgresql/16/bin
+  authentication:
+    superuser:
+      username: postgres
+      password: postgres
+    replication:
+      username: replicator
+      password: replicator_pw
+
+tags:
+  nofailover: false
+  noloadbalance: false

@@ -1,0 +1,46 @@
+# SQL Server Always On availability group lab: one primary and two readable
+# secondaries, with CLUSTER_TYPE = NONE (no Windows or Pacemaker cluster;
+# failover is manual). Developer edition, free for testing.
+#
+#   docker compose up -d        start three empty instances
+#   bash run-all.sh             build the availability group and run every scenario
+#   docker compose down -v      reset everything, including data
+#
+# Each instance is limited to 1.5 GB and uses about 1 GB for this lab.
+name: mssql-replication-lab
+
+x-mssql: &mssql
+  image: mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04
+  # Root so all three instances can read and write the shared certificate volume.
+  user: root
+  environment:
+    ACCEPT_EULA: "Y"
+    MSSQL_PID: Developer
+    MSSQL_SA_PASSWORD: Lab_Passw0rd!
+    MSSQL_ENABLE_HADR: "1"           # turn on the Always On feature
+    # Kept low so three instances fit on a laptop; run-all.sh also caps the buffer pool.
+    MSSQL_MEMORY_LIMIT_MB: "1536"
+  volumes:
+    - ./sql:/sql:ro
+    - certs:/certs
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -b -Q 'SELECT 1' -o /dev/null"]
+    interval: 3s
+    timeout: 5s
+    retries: 80
+    start_period: 10s
+
+services:
+  # The hostname becomes @@SERVERNAME, which is how the availability group names each replica.
+  sql1:
+    <<: *mssql
+    hostname: sql1
+  sql2:
+    <<: *mssql
+    hostname: sql2
+  sql3:
+    <<: *mssql
+    hostname: sql3
+
+volumes:
+  certs: {}

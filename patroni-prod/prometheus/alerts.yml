@@ -1,0 +1,52 @@
+# Alert rules. This lab has no Alertmanager, so firing alerts only show up at
+# http://localhost:9090/alerts. In production they would page someone.
+groups:
+  - name: postgres-ha
+    rules:
+      - alert: NoPrimary
+        expr: sum(patroni_primary) == 0 or absent(patroni_primary)
+        for: 20s
+        annotations:
+          summary: "No node is the primary: writes are failing (a failover may be in progress)"
+
+      - alert: SplitBrain
+        expr: sum(patroni_primary) > 1
+        for: 10s
+        annotations:
+          summary: "More than one node thinks it is primary"
+
+      - alert: PatroniNodeDown
+        expr: up{job="patroni"} == 0
+        for: 15s
+        annotations:
+          summary: "Patroni on {{ $labels.instance }} is not responding"
+
+      - alert: PostgresNotRunning
+        expr: patroni_postgres_running == 0
+        for: 15s
+        annotations:
+          summary: "Postgres is not running on {{ $labels.instance }}"
+
+      - alert: NoSynchronousStandby
+        expr: sum(patroni_sync_standby) == 0
+        for: 30s
+        annotations:
+          summary: "No synchronous standby: commits are only on the primary (a failover now could lose data)"
+
+      - alert: EtcdNoLeader
+        expr: etcd_server_has_leader == 0
+        for: 10s
+        annotations:
+          summary: "etcd member {{ $labels.instance }} has no leader"
+
+      - alert: EtcdMemberDown
+        expr: up{job="etcd"} == 0
+        for: 15s
+        annotations:
+          summary: "etcd member {{ $labels.instance }} is down (the cluster survives one loss, not two)"
+
+      - alert: HaproxyDown
+        expr: up{job="haproxy"} == 0
+        for: 15s
+        annotations:
+          summary: "HAProxy {{ $labels.instance }} is down"

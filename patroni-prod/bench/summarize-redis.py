@@ -30,9 +30,15 @@ for name in series:
     print(f"\n### {NAMES.get(name, name)}")
     c_off, f_off = ceiling(off)
     c_on, f_on = ceiling(on)
-    print(f"ceiling (last step that passed):  Redis OFF {c_off:>6,} req/s   Redis ON {c_on:>6,} req/s"
-          + (f"   ({c_on / c_off:.1f}x)" if c_off else ""))
+    # The test steps in coarse increments, so "last step that passed" understates the real limit: the system
+    # often completes most of the next step's rate before it fails. Peak completed throughput is the fairer
+    # comparison.
+    peak = lambda rows: max((float(r["achieved_rps"]) for r in rows), default=0)
+    p_off, p_on = peak(off), peak(on)
+    print(f"last step that passed:            Redis OFF {c_off:>6,} req/s   Redis ON {c_on:>6,} req/s")
     print(f"first failing step:               Redis OFF {f_off or 'none reached':>6}         Redis ON {f_on or 'none reached':>6}")
+    print(f"peak throughput completed:        Redis OFF {p_off:>6,.0f} req/s   Redis ON {p_on:>6,.0f} req/s"
+          + (f"   ({p_on / p_off:.1f}x)" if p_off else ""))
     rates = sorted({int(r["target_rps"]) for r in off + on})
     print(f"\n{'rate':>6} | {'p95 off':>8} {'p95 on':>7} | {'replica% off':>12} {'replica% on':>11} | {'api cores off':>13} {'on':>5} | {'redis cores':>11} {'hit%':>5} | {'vm% off':>7} {'on':>4}")
     by = lambda rows: {int(r["target_rps"]): r for r in rows}

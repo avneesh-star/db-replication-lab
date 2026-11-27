@@ -32,7 +32,7 @@ export const options = {
     load: {
       executor: 'constant-arrival-rate',
       rate: RATE, timeUnit: '1s', duration: DURATION,
-      preAllocatedVUs: Math.min(RATE, 400), maxVUs: 4000,
+      preAllocatedVUs: parseInt(__ENV.PREALLOC || Math.min(RATE, 400)), maxVUs: 4000,
     },
   },
   setupTimeout: '300s',

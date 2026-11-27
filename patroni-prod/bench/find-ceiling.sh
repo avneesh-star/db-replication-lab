@@ -39,7 +39,8 @@ vmstat_line() { docker exec ${PROJECT}-redis-1 head -1 /proc/stat 2>/dev/null; }
 sample() {
   local lead names n apis; lead=$(leader)
   apis=$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT}-api-[0-9]+$" | tr '\n' ' ')
-  names="$apis haproxy1 pg-node1 pg-node2 pg-node3 redis"
+  dbs="pg-node1 pg-node2 pg-node3"; docker ps --format '{{.Names}}' | grep -q "^${PROJECT}-pg-node4-1$" && dbs="$dbs pg-node4"
+  names="$apis haproxy1 $dbs redis"
   declare -A U0 T0 U1 T1
   local vm0 vm1; vm0=$(vmstat_line)
   for n in $names; do T0[$n]=$(date +%s%N); U0[$n]=$(usec "$n"); done
@@ -50,7 +51,7 @@ sample() {
   cpu() { awk -v a="${U0[$1]:-0}" -v b="${U1[$1]:-0}" -v ta="${T0[$1]}" -v tb="${T1[$1]}" 'BEGIN {printf "%.2f", (b-a) / ((tb-ta)/1000)}'; }
   cores_api=0; for n in $apis; do cores_api=$(awk -v a="$cores_api" -v b="$(cpu $n)" 'BEGIN {printf "%.2f", a+b}'); done
   cores_hap=$(cpu haproxy1); cores_redis=$(cpu redis)
-  for n in pg-node1 pg-node2 pg-node3; do
+  for n in $dbs; do
     pct=$(awk -v c="$(cpu $n)" 'BEGIN {printf "%.0f", c*100}')
     if [ "$n" = "$lead" ]; then l=$pct; else [ "$pct" -gt "$r" ] && r=$pct; fi
   done

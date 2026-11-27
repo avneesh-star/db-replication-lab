@@ -138,6 +138,22 @@ services:
       - node3-data:/data/pg
       - wal-archive:/archive
 
+  # A fourth Patroni node: one more read replica. Not started by default; add it with
+  #   docker compose --profile extra-replica up -d pg-node4
+  pg-node4:
+    <<: *node
+    hostname: pg-node4
+    profiles: ["extra-replica"]
+    environment:
+      <<: *node-env
+      PATRONI_NAME: pg-node4
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node4:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node4:5432
+    volumes:
+      - ./config:/config:ro
+      - node4-data:/data/pg
+      - wal-archive:/archive
+
   # ---- Two HAProxy instances: clients can use either, so one failing is not an outage --
   haproxy1:
     <<: *haproxy
@@ -297,5 +313,6 @@ volumes:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
   wal-archive:
   backups:

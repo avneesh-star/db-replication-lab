@@ -9,7 +9,7 @@ scrape_configs:
   - job_name: patroni
     metrics_path: /metrics
     static_configs:
-      - targets: ["pg-node1:8008", "pg-node2:8008", "pg-node3:8008"]
+      - targets: ["pg-node1:8008", "pg-node2:8008", "pg-node3:8008", "pg-node4:8008"]
   - job_name: etcd
     metrics_path: /metrics
     static_configs:

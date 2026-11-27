@@ -15,6 +15,29 @@ numbers as direction, not capacity. Branch: `feature/scale-out`.
 | **Load balancer retries** (4 API instances, one killed under 2,000 req/s) | failed requests 95 of 73,653 (0.13%) -> 0 of 72,895; slowest request 10.4 s -> 4.9 s; the dead instance was dropped from rotation after about 1.3 s either way |
 | **HTTP caching headers** | implemented and verified with curl (`Cache-Control: public, max-age=N` on found links, none on 404); the benefit comes from browsers and CDNs, which this lab does not have, so it was not benchmarked |
 
+## Final capacity (end to end, `bench/final-capacity.sh`)
+
+Redis cache + in-process cache + write batching all on, one API instance, requests through the load balancer, each
+database node limited to 1 CPU. Each workload stepped up (20 s per step) until a step failed (p95 >= 500 ms, errors >= 1%,
+or >= 3% dropped).
+
+| Workload | Last step passed | Peak completed | Reads/s at peak | Writes/s at peak | p95 at peak |
+|---|---:|---:|---:|---:|---:|
+| Reads only | 6,000 req/s (p95 19 ms) | 7,472 | 7,472 | 0 | 54 ms |
+| 99% reads / 1% writes | 6,000 (p95 49 ms) | 6,989 | 6,919 | 70 | 84 ms |
+| 85% reads / 15% writes | 4,000 (p95 52 ms) | 4,800 | 4,080 | 720 | 71 ms |
+| Writes only | 3,000 (p95 90 ms) | 3,809 | 0 | 3,809 | 129 ms |
+
+Against the original setup (no Redis, no batching): reads about 3,800/s -> about 7,500/s (2.0x); writes about 550-800/s ->
+about 3,000-3,800/s (4-5x); 99/1 mix 3,441 -> 6,989 total (2.0x); 85/15 mix 2,658 -> 4,800 total (1.8x).
+
+What to plan on: the last passing step, with about 30% headroom, is roughly 4,200 reads/s, or 2,100 writes/s, or about 2,800 req/s of
+an 85/15 mix (about 2,400 reads and 420 writes). The read figure is lower than the 9,700 measured straight to the API because the
+load balancer adds a hop.
+
+At every failing step the API (0.4-0.8 cores), the databases (2-9% CPU) and the VM (38-45% busy) were well below saturation, so the
+cap is the same unexplained one described below. Single runs on a shared laptop.
+
 ## What did not help (or was not shown to)
 
 | Change | Result |

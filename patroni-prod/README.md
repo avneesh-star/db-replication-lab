@@ -156,6 +156,36 @@ Reading these results:
 
 Not run on this stack: stopping the sync standby, `patronictl switchover`, and restoring from a backup. Expected behaviour for the first two, from how Patroni works: `NoSynchronousStandby` fires and Patroni promotes the other replica to sync standby; a switchover is a planned, near-instant leader change.
 
+## Benchmarks: how much load can it take?
+
+Measured on a Docker Desktop laptop (8 CPUs for Docker, each database node limited to 1 CPU and 1 GB). Full tables and caveats are in [`bench/RESULTS.md`](bench/RESULTS.md).
+
+| What | Result |
+|---|---|
+| Reads through the API (replicas) | ceiling about **3,900 requests/s**; the replicas run out of CPU |
+| Writes through the API (primary) | ceiling about **400-600 writes/s**; the leader runs out of CPU |
+| Mixed, 85% reads / 15% writes | roughly **3,000-4,000 requests/s**; writes saturate first |
+| Direct database reads (`pgbench`, replicas) | about 7,900 queries/s; reads through the API reached about half of that |
+| Connections | `max_connections = 200`; 260 clients are refused with "too many clients already" |
+
+Run them yourself (the stack must be up). `run-benchmark.sh` drops its test database afterwards; the API tests leave the rows they insert in the `links` table:
+
+```bash
+bash bench/run-benchmark.sh      # pgbench: writes, reads, mixed, commit modes, connection limit (about 12 minutes)
+bash bench/find-ceiling.sh       # breakpoint test through the API: raises the request rate until it breaks
+RATES="100 200 400 600" WRITE_SHARE=1 bash bench/find-ceiling.sh    # writes only; WRITE_SHARE=0 for reads only
+docker run --rm --network patroni-prod_default -v "$PWD/bench:/bench" grafana/k6:0.52.0 run /bench/k6-api.js    # ramping mixed load
+```
+
+Read the numbers with care:
+
+- **The disk limits writes here.** Every commit waits for a flush on the primary and on the synchronous standby. This machine's disk managed 260-650 `fdatasync` operations per second and once dropped to about 70 after sustained load, which made write latency in one run several seconds. It recovered when idle. Real servers do far more.
+- **The API can hide a struggling database.** It retries transient errors, so a slow database shows up as very high latency with 0% errors. Watch latency, not just the error rate.
+- **Everything shares one machine.** The load generator, API, HAProxy and databases compete for the same 8 CPUs, so the true limits of the architecture on proper hardware are higher, especially for reads.
+- **Most points are a single run.** Expect noise; the write ceiling in particular is a range, not a point.
+
+Watch the Grafana dashboard (http://localhost:3001) while a benchmark runs to see throughput, CPU and replication lag move.
+
 ## Backups
 
 WAL archiving is on: every completed WAL segment is copied to the `wal-archive` volume (a stand-in for S3 or GCS), and a base backup is taken on demand from a **replica**, so the primary carries no backup load.
@@ -218,3 +248,7 @@ There is no Alertmanager, so alerts only appear in Prometheus and in the dashboa
 | `scripts/backup.sh` | base backup from a replica |
 | `failover-test.sh` | primary failure test (graceful stop, or crash with `KILL=1`) |
 | `failure-tests.sh` | HAProxy loss, etcd member loss, and etcd quorum loss |
+| `bench/run-benchmark.sh` | pgbench load tests against the database layer |
+| `bench/find-ceiling.sh`, `bench/k6-ceiling.js` | breakpoint test through the API |
+| `bench/k6-api.js` | ramping mixed load through the API |
+| `bench/RESULTS.md` | the measured results and their caveats |

@@ -5,6 +5,7 @@ using Npgsql;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<LinkCache>();
+builder.Services.AddSingleton<WriteBatcher>();
 builder.Services.AddSingleton<LinkRepository>();
 var app = builder.Build();
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Npgsql;
 
@@ -9,7 +10,7 @@ public sealed record CreateResult(Link Link, bool Created, string? Conflict = nu
 
 public sealed record ReadResult(Link? Link, string ServedBy, int Attempts);
 
-public sealed class LinkRepository(Db db, LinkCache cache, IConfiguration config, ILogger<LinkRepository> log)
+public sealed class LinkRepository(Db db, LinkCache cache, WriteBatcher batcher, IConfiguration config, ILogger<LinkRepository> log)
 {
     private readonly TimeSpan _writeWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:WriteRetryWindowSeconds", 45));
     private readonly TimeSpan _readWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:ReadRetryWindowSeconds", 3));
@@ -38,49 +39,72 @@ public sealed class LinkRepository(Db db, LinkCache cache, IConfiguration config
     /// is safe even when a commit succeeded but its acknowledgement was lost in a failover:
     ///   - the code is chosen ONCE, outside the loop, so every attempt targets the same row;
     ///   - ON CONFLICT DO NOTHING turns a repeat into "already exists", not an error.
+    /// With Writes:Batch:Enabled the insert goes through <see cref="WriteBatcher"/>, which commits many
+    /// rows at once; the rules above still hold.
     /// </summary>
     public async Task<Attempt<CreateResult>> CreateAsync(string url, string? code, string? idempotencyKey, CancellationToken ct)
     {
         var chosen = code ?? NewCode();
-        var result = await Resilience.RetryAsync(async c =>
-        {
-            await using var insert = db.Writer.CreateCommand($"""
-                INSERT INTO links (short_code, long_url, idempotency_key)
-                VALUES ($1, $2, $3)
-                ON CONFLICT DO NOTHING
-                RETURNING {Columns}
-                """);
-            insert.Parameters.AddWithValue(chosen);
-            insert.Parameters.AddWithValue(url);
-            insert.Parameters.AddWithValue((object?)idempotencyKey ?? DBNull.Value);
-            await using (var r = await insert.ExecuteReaderAsync(c))
-                if (await r.ReadAsync(c))
-                    return new CreateResult(ReadLink(r), Created: true);
-
-            // Nothing inserted: a row with this key or code already exists.
-            await using var find = db.Writer.CreateCommand($"""
-                SELECT {Columns}, long_url = $2 AS same_url
-                FROM links WHERE idempotency_key = $3 OR short_code = $1
-                ORDER BY (idempotency_key = $3) DESC NULLS LAST
-                LIMIT 1
-                """);
-            find.Parameters.AddWithValue(chosen);
-            find.Parameters.AddWithValue(url);
-            find.Parameters.AddWithValue((object?)idempotencyKey ?? DBNull.Value);
-            await using var f = await find.ExecuteReaderAsync(c);
-            if (!await f.ReadAsync(c))
-                throw new NpgsqlException("insert conflicted but no row found; retrying");
-
-            var existing = ReadLink(f);
-            return f.GetBoolean(3)
-                ? new CreateResult(existing, Created: false)                               // a replay of the same request
-                : new CreateResult(existing, Created: false, Conflict: "code already used for a different URL");
-        }, _writeWindow, log, "create link", ct);
+        var result = batcher.Enabled
+            ? await CreateBatchedAsync(url, chosen, idempotencyKey, ct)
+            : await Resilience.RetryAsync(c => InsertOneAsync(url, chosen, idempotencyKey, c), _writeWindow, log, "create link", ct);
 
         // Populate the cache after the database has committed (never before), so the cache can only
         // ever hold rows that exist. A conflict means the code belongs to a different URL: cache nothing.
         if (result.Value.Conflict is null) cache.Set(result.Value.Link);
         return result;
+    }
+
+    private async Task<Attempt<CreateResult>> CreateBatchedAsync(string url, string code, string? key, CancellationToken ct)
+    {
+        var clock = Stopwatch.StartNew();
+        var inserted = await batcher.EnqueueAsync(code, url, key);
+        if (inserted is not null)
+            return new Attempt<CreateResult>(new CreateResult(inserted, Created: true), 1, clock.ElapsedMilliseconds);
+
+        // Not inserted: the code or key already exists (or was repeated in the same batch). Resolve it as before.
+        var existing = await Resilience.RetryAsync(c => FindExistingAsync(url, code, key, c), _writeWindow, log, "resolve existing link", ct);
+        return new Attempt<CreateResult>(existing.Value, existing.Attempts, clock.ElapsedMilliseconds);
+    }
+
+    private async Task<CreateResult> InsertOneAsync(string url, string chosen, string? idempotencyKey, CancellationToken c)
+    {
+        await using var insert = db.Writer.CreateCommand($"""
+            INSERT INTO links (short_code, long_url, idempotency_key)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            RETURNING {Columns}
+            """);
+        insert.Parameters.AddWithValue(chosen);
+        insert.Parameters.AddWithValue(url);
+        insert.Parameters.AddWithValue((object?)idempotencyKey ?? DBNull.Value);
+        await using (var r = await insert.ExecuteReaderAsync(c))
+            if (await r.ReadAsync(c))
+                return new CreateResult(ReadLink(r), Created: true);
+
+        // Nothing inserted: a row with this key or code already exists.
+        return await FindExistingAsync(url, chosen, idempotencyKey, c);
+    }
+
+    private async Task<CreateResult> FindExistingAsync(string url, string chosen, string? idempotencyKey, CancellationToken c)
+    {
+        await using var find = db.Writer.CreateCommand($"""
+            SELECT {Columns}, long_url = $2 AS same_url
+            FROM links WHERE idempotency_key = $3 OR short_code = $1
+            ORDER BY (idempotency_key = $3) DESC NULLS LAST
+            LIMIT 1
+            """);
+        find.Parameters.AddWithValue(chosen);
+        find.Parameters.AddWithValue(url);
+        find.Parameters.AddWithValue((object?)idempotencyKey ?? DBNull.Value);
+        await using var f = await find.ExecuteReaderAsync(c);
+        if (!await f.ReadAsync(c))
+            throw new NpgsqlException("insert conflicted but no row found; retrying");
+
+        var existing = ReadLink(f);
+        return f.GetBoolean(3)
+            ? new CreateResult(existing, Created: false)                               // a replay of the same request
+            : new CreateResult(existing, Created: false, Conflict: "code already used for a different URL");
     }
 
     /// <summary>

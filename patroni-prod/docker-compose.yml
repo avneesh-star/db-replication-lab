@@ -223,6 +223,10 @@ services:
     ports: ["5101:8080"]
     environment:
       # CACHE_ENABLED=false turns the Redis cache off without rebuilding, for before/after benchmarks.
+      # WRITE_BATCHING=true groups concurrent creates into one multi-row INSERT per commit (see WriteBatcher.cs).
+      Writes__Batch__Enabled: "${WRITE_BATCHING:-false}"
+      Writes__Batch__MaxSize: "100"
+      Writes__Batch__Workers: "4"
       Cache__Enabled: "${CACHE_ENABLED:-true}"
       Cache__TtlSeconds: "300"
       ConnectionStrings__Redis: "redis:6379,password=${REDIS_PASSWORD},abortConnect=false,connectTimeout=500,syncTimeout=200,asyncTimeout=200"

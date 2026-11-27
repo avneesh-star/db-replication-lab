@@ -9,7 +9,7 @@ public sealed record CreateResult(Link Link, bool Created, string? Conflict = nu
 
 public sealed record ReadResult(Link? Link, string ServedBy, int Attempts);
 
-public sealed class LinkRepository(Db db, IConfiguration config, ILogger<LinkRepository> log)
+public sealed class LinkRepository(Db db, LinkCache cache, IConfiguration config, ILogger<LinkRepository> log)
 {
     private readonly TimeSpan _writeWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:WriteRetryWindowSeconds", 45));
     private readonly TimeSpan _readWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:ReadRetryWindowSeconds", 3));
@@ -42,7 +42,7 @@ public sealed class LinkRepository(Db db, IConfiguration config, ILogger<LinkRep
     public async Task<Attempt<CreateResult>> CreateAsync(string url, string? code, string? idempotencyKey, CancellationToken ct)
     {
         var chosen = code ?? NewCode();
-        return await Resilience.RetryAsync(async c =>
+        var result = await Resilience.RetryAsync(async c =>
         {
             await using var insert = db.Writer.CreateCommand($"""
                 INSERT INTO links (short_code, long_url, idempotency_key)
@@ -76,6 +76,11 @@ public sealed class LinkRepository(Db db, IConfiguration config, ILogger<LinkRep
                 ? new CreateResult(existing, Created: false)                               // a replay of the same request
                 : new CreateResult(existing, Created: false, Conflict: "code already used for a different URL");
         }, _writeWindow, log, "create link", ct);
+
+        // Populate the cache after the database has committed (never before), so the cache can only
+        // ever hold rows that exist. A conflict means the code belongs to a different URL: cache nothing.
+        if (result.Value.Conflict is null) cache.Set(result.Value.Link);
+        return result;
     }
 
     /// <summary>
@@ -84,6 +89,18 @@ public sealed class LinkRepository(Db db, IConfiguration config, ILogger<LinkRep
     /// If the reader endpoint is down entirely, the primary serves the read.
     /// </summary>
     public async Task<ReadResult> GetAsync(string code, CancellationToken ct)
+    {
+        // 1. Redis. A hit costs well under a millisecond and puts no load on any Postgres node.
+        var cached = await cache.GetAsync(code);
+        if (cached is not null) return new ReadResult(cached, "cache", 0);
+
+        // 2. A replica, then the primary (see the notes above).
+        var result = await GetFromDatabaseAsync(code, ct);
+        if (result.Link is not null) cache.Set(result.Link);
+        return result;
+    }
+
+    private async Task<ReadResult> GetFromDatabaseAsync(string code, CancellationToken ct)
     {
         try
         {

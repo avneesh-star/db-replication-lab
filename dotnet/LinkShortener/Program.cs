@@ -4,6 +4,7 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<Db>();
+builder.Services.AddSingleton<LinkCache>();
 builder.Services.AddSingleton<LinkRepository>();
 var app = builder.Build();
 
@@ -70,7 +71,7 @@ app.MapGet("/stats", async (Db db, CancellationToken ct) =>
     return Results.Ok(new { links = r.GetInt64(0), replayLagMs = r.IsDBNull(1) ? (double?)null : Math.Round(r.GetDouble(1)), servedBy = "replica" });
 });
 
-app.MapGet("/health/db", async (Db db, CancellationToken ct) =>
+app.MapGet("/health/db", async (Db db, LinkCache cache, CancellationToken ct) =>
 {
     async Task<object> Probe(NpgsqlDataSource source)
     {
@@ -88,7 +89,7 @@ app.MapGet("/health/db", async (Db db, CancellationToken ct) =>
 
     var writer = await Probe(db.Writer);
     var reader = await Probe(db.Reader);
-    return Results.Ok(new { writer, reader });
+    return Results.Ok(new { writer, reader, cache = await cache.ProbeAsync() });
 });
 
 app.Run();

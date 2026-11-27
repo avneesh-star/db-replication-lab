@@ -27,7 +27,7 @@ leader() { curl -s "$PROM/api/v1/query" --data-urlencode 'query=patroni_primary 
            | python -I -c "import sys,json; r=json.load(sys.stdin)['data']['result']; print(r[0]['metric']['instance'].split(':')[0] if r else '')"; }
 
 victim=$(leader); [ -n "$victim" ] || { echo "no primary; is the stack healthy?"; exit 1; }
-mode=$(curl -s localhost:5101/health/db >/dev/null && docker exec ${PROJECT}-api-1 printenv Writes__Batch__Enabled)
+mode=$(curl -s localhost:5101/health/db >/dev/null && docker exec $(docker ps --format '{{.Names}}' | grep -E "^${PROJECT}-api-[0-9]+$" | sort -t- -k4 -n | head -1) printenv Writes__Batch__Enabled)
 before=$(psqlp -c "SELECT count(*) FROM links WHERE short_code LIKE 'ceil-%'")
 echo "write batching enabled: ${mode:-unknown}   leader: $victim   rate: $RATE writes/s for ${DURATION}s, leader killed at ${KILL_AT}s"
 

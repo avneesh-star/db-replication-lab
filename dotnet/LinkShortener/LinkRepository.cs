@@ -10,7 +10,7 @@ public sealed record CreateResult(Link Link, bool Created, string? Conflict = nu
 
 public sealed record ReadResult(Link? Link, string ServedBy, int Attempts);
 
-public sealed class LinkRepository(Db db, LinkCache cache, WriteBatcher batcher, IConfiguration config, ILogger<LinkRepository> log)
+public sealed class LinkRepository(Db db, LocalCache local, LinkCache cache, WriteBatcher batcher, IConfiguration config, ILogger<LinkRepository> log)
 {
     private readonly TimeSpan _writeWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:WriteRetryWindowSeconds", 45));
     private readonly TimeSpan _readWindow = TimeSpan.FromSeconds(config.GetValue("Resilience:ReadRetryWindowSeconds", 3));
@@ -51,7 +51,7 @@ public sealed class LinkRepository(Db db, LinkCache cache, WriteBatcher batcher,
 
         // Populate the cache after the database has committed (never before), so the cache can only
         // ever hold rows that exist. A conflict means the code belongs to a different URL: cache nothing.
-        if (result.Value.Conflict is null) cache.Set(result.Value.Link);
+        if (result.Value.Conflict is null) { local.Set(result.Value.Link); cache.Set(result.Value.Link); }
         return result;
     }
 
@@ -114,13 +114,21 @@ public sealed class LinkRepository(Db db, LinkCache cache, WriteBatcher batcher,
     /// </summary>
     public async Task<ReadResult> GetAsync(string code, CancellationToken ct)
     {
-        // 1. Redis. A hit costs well under a millisecond and puts no load on any Postgres node.
-        var cached = await cache.GetAsync(code);
-        if (cached is not null) return new ReadResult(cached, "cache", 0);
+        // 1. This process's own memory: microseconds, no network.
+        var inMemory = local.Get(code);
+        if (inMemory is not null) return new ReadResult(inMemory, "memory", 0);
 
-        // 2. A replica, then the primary (see the notes above).
+        // 2. Redis. A hit costs well under a millisecond and puts no load on any Postgres node.
+        var cached = await cache.GetAsync(code);
+        if (cached is not null)
+        {
+            local.Set(cached);
+            return new ReadResult(cached, "cache", 0);
+        }
+
+        // 3. A replica, then the primary (see the notes above).
         var result = await GetFromDatabaseAsync(code, ct);
-        if (result.Link is not null) cache.Set(result.Link);
+        if (result.Link is not null) { local.Set(result.Link); cache.Set(result.Link); }
         return result;
     }
 

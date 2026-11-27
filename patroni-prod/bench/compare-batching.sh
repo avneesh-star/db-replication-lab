@@ -21,7 +21,7 @@ step() { printf '\n\033[1;36m=== %s\033[0m\n' "$*"; }
 set_batching() {   # $1 = true | false
   WRITE_BATCHING=$1 docker compose up -d --force-recreate --no-deps api >/dev/null 2>&1
   for _ in $(seq 1 60); do curl -sf localhost:5101/health/db >/dev/null 2>&1 && break; sleep 2; done
-  echo "API restarted with write batching = $(docker exec patroni-prod-api-1 printenv Writes__Batch__Enabled)"
+  echo "API restarted with write batching = $(docker exec $(docker ps --format '{{.Names}}' | grep -E '^patroni-prod-api-[0-9]+$' | sort -t- -k4 -n | head -1) printenv Writes__Batch__Enabled)"
 }
 
 for pass in $(seq 1 "$PASSES"); do

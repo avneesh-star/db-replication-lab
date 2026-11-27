@@ -4,6 +4,7 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<Db>();
+builder.Services.AddSingleton<LocalCache>();
 builder.Services.AddSingleton<LinkCache>();
 builder.Services.AddSingleton<WriteBatcher>();
 builder.Services.AddSingleton<LinkRepository>();
@@ -16,6 +17,16 @@ var codePattern = new Regex("^[A-Za-z0-9_-]{3,32}$", RegexOptions.Compiled);
 // so set Database__EnsureSchema=false there.
 if (app.Configuration.GetValue("Database:EnsureSchema", true))
     await app.Services.GetRequiredService<LinkRepository>().EnsureSchemaAsync(app.Lifetime.ApplicationStopping);
+
+// Liveness only (no database call), for load balancer health checks.
+app.MapGet("/healthz", () => Results.Text("ok"));
+
+// Links never change once created, so a response can be cached by browsers and CDNs. 0 turns it off.
+var httpMaxAge = app.Configuration.GetValue("Http:CacheMaxAgeSeconds", 0);
+void ApplyHttpCache(HttpContext http, bool found)
+{
+    if (httpMaxAge > 0 && found) http.Response.Headers.CacheControl = $"public, max-age={httpMaxAge}";
+}
 
 app.MapGet("/", () => Results.Text("""
     Link shortener on a Patroni PostgreSQL cluster
@@ -49,6 +60,7 @@ app.MapGet("/links/{code}", async (string code, HttpContext http, LinkRepository
 {
     var r = await repo.GetAsync(code, ct);
     http.Response.Headers["X-Served-By"] = r.ServedBy;
+    ApplyHttpCache(http, r.Link is not null);
     return r.Link is null
         ? Results.NotFound(new { error = "unknown code", servedBy = r.ServedBy })
         : Results.Ok(new { r.Link.Code, r.Link.Url, r.Link.CreatedAt, servedBy = r.ServedBy });
@@ -58,6 +70,7 @@ app.MapGet("/r/{code}", async (string code, HttpContext http, LinkRepository rep
 {
     var r = await repo.GetAsync(code, ct);
     http.Response.Headers["X-Served-By"] = r.ServedBy;
+    ApplyHttpCache(http, r.Link is not null);
     return r.Link is null ? Results.NotFound() : Results.Redirect(r.Link.Url);
 });
 

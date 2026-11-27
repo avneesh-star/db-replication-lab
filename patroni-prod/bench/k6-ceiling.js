@@ -23,17 +23,23 @@ const HOT_KEYS = Math.max(1, Math.floor(KEYS * 0.2));
 const OUT = __ENV.OUT || `/bench/results/k6-rate-${RATE}.json`;
 
 // Where each read was served from, according to the API's X-Served-By header.
+const fromMemory = new Counter('read_from_memory');
 const fromCache = new Counter('read_from_cache');
 const fromReplica = new Counter('read_from_replica');
 const fromPrimary = new Counter('read_from_primary');
 
+// VUS set: closed model (a fixed number of simultaneous users, each sending the next request when the last
+// one finishes). That is what exhausts connection pools. Otherwise: open model at a fixed request rate.
+const VUS = parseInt(__ENV.VUS || '0');
 export const options = {
   scenarios: {
-    load: {
-      executor: 'constant-arrival-rate',
-      rate: RATE, timeUnit: '1s', duration: DURATION,
-      preAllocatedVUs: parseInt(__ENV.PREALLOC || Math.min(RATE, 400)), maxVUs: 4000,
-    },
+    load: VUS > 0
+      ? { executor: 'constant-vus', vus: VUS, duration: DURATION }
+      : {
+          executor: 'constant-arrival-rate',
+          rate: RATE, timeUnit: '1s', duration: DURATION,
+          preAllocatedVUs: parseInt(__ENV.PREALLOC || Math.min(RATE, 400)), maxVUs: 4000,
+        },
   },
   setupTimeout: '300s',
   // Loose thresholds exist only so k6 reports the per-kind sub-metrics in its summary.
@@ -81,7 +87,8 @@ export default function () {
     const r = http.get(`${BASE}/links/${pickKey()}`, { tags: { kind: 'read' } });
     check(r, { 'read 200': (x) => x.status === 200 });
     const src = r.headers['X-Served-By'];
-    if (src === 'cache') fromCache.add(1);
+    if (src === 'memory') fromMemory.add(1);
+    else if (src === 'cache') fromCache.add(1);
     else if (src === 'replica') fromReplica.add(1);
     else if (src === 'primary') fromPrimary.add(1);
   }

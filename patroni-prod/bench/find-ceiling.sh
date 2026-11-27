@@ -32,13 +32,14 @@ echo "target_rps,achieved_rps,p95_ms,p99_ms,write_p95_ms,read_p95_ms,error_pct,d
 psqlp() { docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" ${PROJECT}-pg-node1-1 psql -h haproxy1 -p 5000 -U postgres -d lab -X -tA "$@"; }
 leader() { curl -s "$PROM/api/v1/query" --data-urlencode 'query=patroni_primary == 1' \
            | python -I -c "import sys,json; r=json.load(sys.stdin)['data']['result']; print(r[0]['metric']['instance'].split(':')[0] if r else '')"; }
-usec() { docker exec "${PROJECT}-$1-1" cat /sys/fs/cgroup/cpu.stat 2>/dev/null | awk '/^usage_usec/ {print $2}'; }
-vmstat_line() { docker exec ${PROJECT}-api-1 head -1 /proc/stat 2>/dev/null; }
+usec() { local c=$1; case "$c" in ${PROJECT}-*) ;; *) c=${PROJECT}-$c-1;; esac; docker exec "$c" cat /sys/fs/cgroup/cpu.stat 2>/dev/null | awk '/^usage_usec/ {print $2}'; }
+vmstat_line() { docker exec ${PROJECT}-redis-1 head -1 /proc/stat 2>/dev/null; }
 
 # Measures CPU over ~3 s. Prints: api cores, haproxy1 cores, leader %, busiest replica %, VM busy %, redis cores.
 sample() {
-  local lead names n; lead=$(leader)
-  names="api haproxy1 pg-node1 pg-node2 pg-node3 redis"
+  local lead names n apis; lead=$(leader)
+  apis=$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT}-api-[0-9]+$" | tr '\n' ' ')
+  names="$apis haproxy1 pg-node1 pg-node2 pg-node3 redis"
   declare -A U0 T0 U1 T1
   local vm0 vm1; vm0=$(vmstat_line)
   for n in $names; do T0[$n]=$(date +%s%N); U0[$n]=$(usec "$n"); done
@@ -47,7 +48,8 @@ sample() {
   vm1=$(vmstat_line)
   local cores_api cores_hap cores_redis l=0 r=0 pct
   cpu() { awk -v a="${U0[$1]:-0}" -v b="${U1[$1]:-0}" -v ta="${T0[$1]}" -v tb="${T1[$1]}" 'BEGIN {printf "%.2f", (b-a) / ((tb-ta)/1000)}'; }
-  cores_api=$(cpu api); cores_hap=$(cpu haproxy1); cores_redis=$(cpu redis)
+  cores_api=0; for n in $apis; do cores_api=$(awk -v a="$cores_api" -v b="$(cpu $n)" 'BEGIN {printf "%.2f", a+b}'); done
+  cores_hap=$(cpu haproxy1); cores_redis=$(cpu redis)
   for n in pg-node1 pg-node2 pg-node3; do
     pct=$(awk -v c="$(cpu $n)" 'BEGIN {printf "%.0f", c*100}')
     if [ "$n" = "$lead" ]; then l=$pct; else [ "$pct" -gt "$r" ] && r=$pct; fi
@@ -70,7 +72,7 @@ printf '%-7s %8s %6s %6s %7s %7s %6s %6s %5s | %4s %5s %5s %7s %8s %4s | %5s %8s
 for rate in $RATES; do
   rm -f "bench/results/k6-rate-$rate.json"
   docker run --rm --network "$NET" -v "$PWD/bench:/bench" -e RATE="$rate" -e DURATION="${DURATION}s" \
-    -e WRITE_SHARE="$WRITE_SHARE" -e KEYS="$KEYS" \
+    -e WRITE_SHARE="$WRITE_SHARE" -e KEYS="$KEYS" -e BASE="${BASE:-http://lb:8080}" \
     grafana/k6:0.52.0 run --quiet /bench/k6-ceiling.js >/dev/null 2>&1 &
   kpid=$!
   sleep $(( DURATION / 2 + 4 ))
@@ -90,7 +92,7 @@ def v(name, key, default=0):
 dropped = v("dropped_iterations", "count")
 achieved = v("iterations", "count") / duration       # completed requests per second of the step
 total = v("iterations", "count") + dropped
-c, rep, pri = v("read_from_cache", "count"), v("read_from_replica", "count"), v("read_from_primary", "count")
+c, rep, pri = v("read_from_cache", "count") + v("read_from_memory", "count"), v("read_from_replica", "count"), v("read_from_primary", "count")
 hit = (c / (c + rep + pri) * 100) if (c + rep + pri) else 0
 print(f"{achieved:.0f} {v('http_req_duration','p(95)'):.0f} {v('http_req_duration','p(99)'):.0f} "
       f"{v('http_req_duration{kind:write}','p(95)'):.0f} {v('http_req_duration{kind:read}','p(95)'):.0f} "

@@ -25,7 +25,7 @@ x-node: &node
   depends_on: [etcd1, etcd2, etcd3]
   deploy:
     resources:
-      limits: { cpus: "1.0", memory: 1g }
+      limits: { cpus: "${DB_CPUS:-1.0}", memory: "${DB_MEM:-1g}" }   # raise to test vertical scaling
   healthcheck:
     test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
     interval: 5s
@@ -220,26 +220,62 @@ services:
   api:
     build: ../dotnet/LinkShortener
     restart: on-failure
-    ports: ["5101:8080"]
+    # No host port: several instances can run (docker compose up -d --scale api=N) behind the "lb" service.
     environment:
       # CACHE_ENABLED=false turns the Redis cache off without rebuilding, for before/after benchmarks.
       # WRITE_BATCHING=true groups concurrent creates into one multi-row INSERT per commit (see WriteBatcher.cs).
       Writes__Batch__Enabled: "${WRITE_BATCHING:-false}"
-      Writes__Batch__MaxSize: "100"
-      Writes__Batch__Workers: "4"
+      Writes__Batch__MaxSize: "${BATCH_MAX:-100}"
+      Writes__Batch__Workers: "${BATCH_WORKERS:-4}"
+      # L1_CACHE=true adds a small in-process cache in front of Redis (see LocalCache.cs).
+      Cache__L1__Enabled: "${L1_CACHE:-false}"
+      Cache__L1__TtlSeconds: "30"
+      # HTTP_CACHE_SECONDS>0 adds Cache-Control: public, max-age=N to successful lookups, so browsers and CDNs can cache them.
+      Http__CacheMaxAgeSeconds: "${HTTP_CACHE_SECONDS:-0}"
       Cache__Enabled: "${CACHE_ENABLED:-true}"
       Cache__TtlSeconds: "300"
       ConnectionStrings__Redis: "redis:6379,password=${REDIS_PASSWORD},abortConnect=false,connectTimeout=500,syncTimeout=200,asyncTimeout=200"
-      # Two HAProxy hosts: the driver moves to the second if the first is unreachable.
+      # Where the database connections go. Default: straight to the two HAProxy instances (the driver moves to
+      # the second if the first is unreachable). With PgBouncer: DB_WRITER_HOST=pgbouncer DB_WRITER_PORT=6432
+      # DB_READER_HOST=pgbouncer DB_READER_PORT=6432 DB_READER_DB=lab_ro DB_EXTRA=";No Reset On Close=true"
       # app_user can read and write rows but cannot change the schema.
-      ConnectionStrings__Writer: "Host=haproxy1,haproxy2;Port=5000;Database=lab;Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60"
-      ConnectionStrings__Reader: "Host=haproxy1,haproxy2;Port=5001;Database=lab;Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Maximum Pool Size=20;Connection Lifetime=60;Load Balance Hosts=true"
+      ConnectionStrings__Writer: "Host=${DB_WRITER_HOST:-haproxy1,haproxy2};Port=${DB_WRITER_PORT:-5000};Database=${DB_WRITER_DB:-lab};Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Minimum Pool Size=${DB_MIN_POOL:-0};Maximum Pool Size=${DB_POOL:-20};Connection Lifetime=60${DB_EXTRA:-}"
+      ConnectionStrings__Reader: "Host=${DB_READER_HOST:-haproxy1,haproxy2};Port=${DB_READER_PORT:-5001};Database=${DB_READER_DB:-lab};Username=app_user;Password=${APP_DB_PASSWORD};Timeout=3;Command Timeout=10;Keepalive=10;Minimum Pool Size=${DB_MIN_POOL:-0};Maximum Pool Size=${DB_POOL:-20};Connection Lifetime=60;Load Balance Hosts=true${DB_EXTRA:-}"
       Database__EnsureSchema: "false"
       Resilience__WriteRetryWindowSeconds: "60"
     depends_on:
       haproxy1: { condition: service_started }
       haproxy2: { condition: service_started }
       redis: { condition: service_healthy }
+      pgbouncer: { condition: service_started }
+
+  # ---- Load balancer in front of the API instances ---------------------------------------
+  lb:
+    image: haproxy:2.9-alpine
+    restart: unless-stopped
+    ports:
+      - "5101:8080"        # the API, load balanced: http://localhost:5101
+      - "7003:7000"        # stats: http://localhost:7003
+    volumes:
+      - ./config/haproxy-lb.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on: [api]
+
+  # ---- Connection pooler ---------------------------------------------------------------
+  # Always running, but the API only uses it when DB_WRITER_HOST / DB_READER_HOST point at it (see the api service).
+  pgbouncer:
+    image: edoburu/pgbouncer@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d   # PgBouncer 1.26.1
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['printf "\"app_user\" \"%s\"
+" "$$APP_DB_PASSWORD" > /tmp/userlist.txt && exec /usr/bin/pgbouncer /etc/pgbouncer/pgbouncer.ini']
+    environment:
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?}
+    volumes:
+      - ./config/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+    depends_on: [haproxy1]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256m }
 
   # ---- Backup job (run on demand: docker compose run --rm backup) ----------------------
   backup:

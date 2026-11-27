@@ -22,7 +22,7 @@ PROJECT=patroni-prod
 NET=${PROJECT}_default
 TARGET=${TARGET:-10000}
 DURATION=${DURATION:-25}
-API1=${PROJECT}-api-1
+API1=$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT}-api-[0-9]+$" | sort -t- -k4 -n | head -1)
 API2=${PROJECT}-api2
 REDIS=${PROJECT}-redis-1
 step() { printf '\n\033[1;36m=== %s\033[0m\n' "$*"; }
